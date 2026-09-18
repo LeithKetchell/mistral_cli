@@ -60,7 +60,10 @@ inline int setenv(const char* name, const char* value, int) {
 #define MISTRAL_CLI_OS "Unknown"
 #endif
 
-#include "mistral_cli.h"
+
+#include <vector>
+#include <string>
+#include <cstdint>
 
 bool debugMode = false;
 const int MAX_RETRIES = 3;
@@ -75,6 +78,122 @@ int currentRandomSeed = 0;
 std::set<std::string> g_allowlist;
 bool g_allowlistLoaded = false;
 std::set<std::string> g_processedFiles;
+
+bool autoSave = false; // Add this near your other global variables
+
+static const std::string base64_chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789+/";
+
+#include "mistral_cli.h"
+
+
+std::string base64_encode(const std::string &in) {
+    std::string out;
+    int val = 0;
+    int valb = -6;
+    for (unsigned char c : in) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) {
+        out.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+    while (out.size() % 4) {
+        out.push_back('=');
+    }
+    return out;
+}
+
+bool isValidImageFile(const fs::path& filePath) {
+    std::ifstream in(filePath, std::ios::binary);
+    if (!in) return false;
+
+    // Read the first 12 bytes (enough for PNG/JPEG/WebP headers)
+    std::array<char, 12> header;
+    in.read(header.data(), header.size());
+    in.close();
+
+    // Check for PNG (89 50 4E 47 0D 0A 1A 0A)
+    if (header.size() >= 8 &&
+        static_cast<uint8_t>(header[0]) == 0x89 &&
+        static_cast<uint8_t>(header[1]) == 0x50 &&
+        static_cast<uint8_t>(header[2]) == 0x4E &&
+        static_cast<uint8_t>(header[3]) == 0x47) {
+        return true;
+    }
+
+    // Check for JPEG (FF D8 FF)
+    if (header.size() >= 3 &&
+        static_cast<uint8_t>(header[0]) == 0xFF &&
+        static_cast<uint8_t>(header[1]) == 0xD8 &&
+        static_cast<uint8_t>(header[2]) == 0xFF) {
+        return true;
+    }
+
+    // Check for WebP (RIFF + WEBP)
+    if (header.size() >= 12 &&
+        header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F' &&
+        header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P') {
+        return true;
+    }
+
+    return false;
+}
+
+void autoSaveHistory(const json& history, const std::string& filename = "chat_history.json") {
+    if (!autoSave) return;
+    std::ofstream out(filename);
+    if (out) {
+        out << history.dump(2);
+    }
+}
+
+void loadConfig() {
+    fs::path configPath = fs::weakly_canonical(fs::current_path() / ".mistral_cli.json");
+    if (!fs::exists(configPath)) return;
+
+    std::ifstream in(configPath);
+    if (!in) return;
+
+    try {
+        json config = json::parse(in);
+        if (config.contains("model")) {
+            currentModel = config["model"].get<std::string>();
+        }
+        if (config.contains("temperature")) {
+            currentTemperature = config["temperature"].get<double>();
+        }
+        if (config.contains("max_tokens")) {
+            currentMaxTokens = config["max_tokens"].get<int>();
+        }
+        if (config.contains("autoSave")) {
+            autoSave = config["autoSave"].get<bool>();
+        }
+    } catch (const json::parse_error& e) {
+        std::cerr << "Error parsing config file: " << e.what() << "\n";
+    }
+}
+
+void saveConfig() {
+    fs::path configPath = fs::weakly_canonical(fs::current_path() / ".mistral_cli.json");
+    json config = {
+        {"model", currentModel},
+        {"temperature", currentTemperature},
+        {"max_tokens", currentMaxTokens},
+        {"autoSave", autoSave}
+    };
+    std::ofstream out(configPath);
+    if (out) {
+        out << config.dump(2);
+    }
+}
+
 
 // Spinner utility for indeterminate progress
 void showSpinner(const std::string& message) {
@@ -640,7 +759,9 @@ void parseArguments(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "-debug") {
             debugMode = true;
-        } else if (arg == "--model" && i + 1 < argc) {
+        }else if (arg == "-autosave") {  // New flag for auto-save
+            autoSave = true;
+        }else if (arg == "--model" && i + 1 < argc) {
             currentModel = argv[++i];
         } else if (arg == "--temperature" && i + 1 < argc) {
             currentTemperature = std::stod(argv[++i]);
@@ -1468,6 +1589,7 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
             }
         }
         history.push_back({{"role", "assistant"}, {"content", "Processed all relevant files in CWD."}});
+        autoSaveHistory(history);
         return;
     }
 
@@ -1519,15 +1641,6 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
             }
         }
 
-        if (debugMode) {
-            std::cout << "[DEBUG] Content type: "
-                      << (content.is_object() ? "Object" :
-                          content.is_string() ? "String" :
-                          content.is_array() ? "Array" : "Other")
-                      << "\n";
-            std::cout << "[DEBUG] Content: " << content.dump() << "\n";
-        }
-
         if (content.is_object() && content.contains("answer")) {
             std::string answer = content["answer"].get<std::string>();
 
@@ -1553,6 +1666,7 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
 
             printOutput(answer);
             history.push_back({{"role", "assistant"}, {"content", answer}});
+            autoSaveHistory(history);
             return;
         }
 
@@ -1564,21 +1678,8 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
             json result = executeAction(action, processedFiles);
             history.push_back({{"role", "assistant"}, {"content", content.dump()}});
             history.push_back({{"role", "user"}, {"content", "[action_result] " + result.dump()}});
-            if (result.contains("status")) {
-                if (result["status"] == "success") {
-                    if (result.contains("output")) {
-                        printOutput(result["output"].get<std::string>());
-                    } else if (result.contains("entries")) {
-                        for (const auto& entry : result["entries"]) {
-                            std::string name = entry["name"].get<std::string>();
-                            std::string type = entry["type"].get<std::string>();
-                            printOutput(name + " (" + type + ")");
-                        }
-                    }
-                } else {
-                    std::string reason = result.contains("reason") ? result["reason"].get<std::string>() : "Unknown error";
-                    printOutput("Action failed: " + reason);
-                }
+            if (result.contains("status") && result["status"] == "success") {
+                autoSaveHistory(history);
             }
             continue;
         }
@@ -1586,6 +1687,7 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
         if (content.is_string()) {
             printOutput(content.get<std::string>());
             history.push_back({{"role", "assistant"}, {"content", content.get<std::string>()}});
+            autoSaveHistory(history);
             return;
         }
 
@@ -1595,14 +1697,18 @@ void handleTurn(const std::string& userInput, json& history, const std::string& 
             printOutput("Unexpected response format.");
         }
         history.push_back({{"role", "assistant"}, {"content", content.dump()}});
+        autoSaveHistory(history);
         return;
     }
     printOutput("[agent loop limit reached]");
+    autoSaveHistory(history);
 }
 
 #ifndef TEST_BUILD
 int main(int argc, char* argv[]) {
     parseArguments(argc, argv);
+    loadConfig();
+
     try {
         std::string apiKey = getApiKey();
         json history;
@@ -1612,21 +1718,99 @@ int main(int argc, char* argv[]) {
             if (!std::getline(std::cin, userInput)) break;
             if (userInput == "quit" || userInput == "exit") break;
 
-            // Check for local execution prefixes (e.g., "!run" or "!git")
+            // --- History commands ---
+            if (userInput.rfind("history ", 0) == 0) {
+                std::string subcommand = userInput.substr(8);
+                if (subcommand.empty()) {
+                    printOutput("Usage: history save [filename] | history load [filename] | history clear | history list");
+                    continue;
+                }
+
+                size_t spacePos = subcommand.find(' ');
+                std::string action = subcommand.substr(0, spacePos);
+                std::string filename = (spacePos != std::string::npos) ? subcommand.substr(spacePos + 1) : "chat_history.json";
+
+                if (action == "save") {
+                    std::ofstream out(filename);
+                    if (out) {
+                        out << history.dump(2);
+                        printOutput("Chat history saved to " + filename);
+                    } else {
+                        printOutput("Error: Failed to save history to " + filename);
+                    }
+                }
+                else if (action == "load") {
+                    std::ifstream in(filename);
+                    if (in) {
+                        try {
+                            history = json::parse(in);
+                            printOutput("Chat history loaded from " + filename);
+                        } catch (const json::parse_error& e) {
+                            printOutput("Error: Failed to parse history file " + filename);
+                        }
+                    } else {
+                        printOutput("Error: History file not found: " + filename);
+                    }
+                }
+                else if (action == "clear") {
+                    history = json::array();
+                    printOutput("Chat history cleared.");
+                }
+                else if (action == "list") {
+                    bool found = false;
+                    for (const auto& entry : fs::directory_iterator(".")) {
+                        if (entry.path().extension() == ".json") {
+                            printOutput(entry.path().filename().string());
+                            found = true;
+                        }
+                    }
+                    if (!found) {
+                        printOutput("No saved history files found.");
+                    }
+                }
+                else {
+                    printOutput("Unknown history command. Usage: history save [filename] | history load [filename] | history clear | history list");
+                }
+                continue;
+            }
+
+            // --- Config commands ---
+            if (userInput == "/config save") {
+                saveConfig();
+                printOutput("Config saved to .mistral_cli.json");
+                continue;
+            }
+            if (userInput == "/config load") {
+                loadConfig();
+                printOutput("Config loaded from .mistral_cli.json");
+                continue;
+            }
+
+            // --- Auto-save toggle ---
+            if (userInput == "/autosave on") {
+                autoSave = true;
+                printOutput("Auto-save enabled.");
+                continue;
+            }
+            if (userInput == "/autosave off") {
+                autoSave = false;
+                printOutput("Auto-save disabled.");
+                continue;
+            }
+
+            // --- Local execution prefixes ---
             if (userInput.rfind("!run ", 0) == 0) {
-                std::string command = userInput.substr(5); // Remove "!run " prefix
+                std::string command = userInput.substr(5);
                 if (command.empty()) {
                     std::cout << "Error: No command provided after '!run'.\n";
                     continue;
                 }
-
                 if (isDestructiveShellCommand(command)) {
                     if (!requestPermissionAlways("Execute local command", command)) {
                         std::cout << "Command denied: User aborted destructive local command.\n";
                         continue;
                     }
                 }
-
                 try {
                     std::cout << "[LOCAL EXECUTION] Running: " << command << "\n";
                     std::string output = executeShellCommand(command);
@@ -1638,19 +1822,17 @@ int main(int argc, char* argv[]) {
             }
 
             if (userInput.rfind("!git ", 0) == 0) {
-                std::string gitCommand = userInput.substr(5); // Remove "!git " prefix
+                std::string gitCommand = userInput.substr(5);
                 if (gitCommand.empty()) {
                     std::cout << "Error: No Git command provided after '!git'.\n";
                     continue;
                 }
-
                 if (isDestructiveGitCommand(gitCommand)) {
                     if (!requestPermissionAlways("Execute Git command", gitCommand)) {
                         std::cout << "Git command denied: User aborted destructive Git operation.\n";
                         continue;
                     }
                 }
-
                 try {
                     std::string fullCommand = "git " + gitCommand;
                     std::cout << "[LOCAL GIT EXECUTION] Running: " << fullCommand << "\n";
@@ -1662,11 +1844,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (userInput == "clear" || userInput == "reset") {
-                history = json::array();
-                std::cout << "[history cleared]\n";
-                continue;
-            }
+            // --- Remote actions ---
             if (userInput == "/models") {
                 listModels(apiKey);
                 continue;
@@ -1680,11 +1858,69 @@ int main(int argc, char* argv[]) {
                 std::cout << "[current model: " << currentModel << "]\n";
                 continue;
             }
-            if (userInput == "/help") {
-                std::cout << "Commands: quit|exit, clear|reset, /models, /model <name>, /model, /help, !run <command>, !git <command>\n";
-                std::cout << "Args: --model <name> --temperature <n> --max-tokens <n> --seed <n> -debug\n";
+            if (userInput == "help") {
+                std::cout << "=== Mistral CLI Commands ===\n"
+                          << "  help              - Show this help message\n"
+                          << "Global Actions (no prefix):\n"
+                          << "  quit|exit          - Exit the CLI\n"
+                          << "  clear|reset        - Clear the current chat history\n"
+                          << "  history save [file] - Save chat history to a file (default: chat_history.json)\n"
+                          << "  history load [file] - Load chat history from a file (default: chat_history.json)\n"
+                          << "  history clear       - Clear the current chat history\n"
+                          << "  history list        - List all saved history files in the current directory\n\n"
+                          << "Local Shell Actions (prefix: !):\n"
+                          << "  !run <command>     - Execute a local shell command (e.g., !run ls)\n"
+                          << "  !git <command>     - Execute a Git command (e.g., !git status)\n\n"
+                          << "Remote Actions (prefix: /):\n"
+                          << "  /models            - List available Mistral models\n"
+                          << "  /model             - Show the current model\n"
+                          << "  /model <name>      - Set the current model (e.g., /model mistral-large-latest)\n"
+                          << "  /image <path>      - Upload an image for analysis (PNG/JPEG/WebP, max 10MB)\n\n"
+                          << "Config Actions (prefix: /):\n"
+                          << "  /config save        - Save current settings to .mistral_cli.json\n"
+                          << "  /config load        - Load settings from .mistral_cli.json\n"
+                          << "  /autosave on|off    - Enable/disable auto-saving chat history after each turn\n";
                 continue;
             }
+
+            // --- Image upload ---
+            if (userInput.rfind("/image ", 0) == 0) {
+                std::string imagePath = userInput.substr(7);
+                fs::path resolvedPath = resolvePath(imagePath);
+
+                if (!fs::exists(resolvedPath)) {
+                    printOutput("Error: Image file not found: " + imagePath);
+                    continue;
+                }
+
+                if (!isValidImageFile(resolvedPath)) {
+                    printOutput("Error: File is not a valid image (PNG/JPEG/WebP only).");
+                    continue;
+                }
+
+                uintmax_t fileSize = fs::file_size(resolvedPath);
+                if (fileSize > 10 * 1024 * 1024) {
+                    printOutput("Error: Image file is too large (max 10MB).");
+                    continue;
+                }
+
+                std::ifstream in(resolvedPath, std::ios::binary);
+                std::string imageData((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                std::string base64Data = base64_encode(imageData);
+
+                json imageMessage = {
+                    {"role", "user"},
+                    {"content", {
+                        {"type", "image_url"},
+                        {"image_url", {"url", "data:image/jpeg;base64," + base64Data}}
+                    }}
+                };
+                history.push_back(imageMessage);
+                printOutput("Image uploaded. Send your prompt to analyze it.");
+                continue;
+            }
+
+            // --- Default: Handle as chat input ---
             handleTurn(userInput, history, apiKey);
         }
     } catch (const std::exception& e) {
